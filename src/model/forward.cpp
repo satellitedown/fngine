@@ -317,9 +317,9 @@ void Forward::moe(const MoeWeights& w, int32_t l, float* X, const StepIo& io, cu
   Workspace& ws = *ctx_.ws;
   const int32_t T = io.T;
   const bool mtp = l < 0;
-  // Abliterated packs (README, "Abliterated packs") edit the routed-expert sum along the refusal
-  // direction in the combine kernels. The MTP layer is left alone: the transferred abliteration
-  // does not touch the MTP head.
+  // Abliterated packs (docs/engineering-notes.md, "Abliterated packs") edit the routed-expert sum
+  // along the refusal direction in the combine kernels. The MTP layer is left alone: the
+  // transferred abliteration does not touch the MTP head.
   const float* const ablate =
       (!mtp && ctx_.ablation_directions != nullptr)
           ? ctx_.ablation_directions + std::size_t(l) * std::size_t(dims::kHidden)
