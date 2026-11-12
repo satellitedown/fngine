@@ -3,6 +3,7 @@
 // Small device-side glue for decode/verify steps: round transition after acceptance, selection of
 // the accepted column's MTP state, and single-token step bookkeeping.
 #include "kernels/gdn/gdn.h"
+#include "kernels/head/head.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -22,7 +23,7 @@ struct alignas(16) StepInDev {
   int32_t k;                          // drafts in this step (T = k + 1)
   int32_t length;                     // committed length (RNG position base)
   uint32_t seq;                       // exchange sequence number
-  int32_t pad_;
+  int32_t draft_kind;                 // 1: drafts are the previous step's MTP drafts d1..dk
 };
 
 // Device-resident step outputs, stored to device-mapped host memory at the end of every graph.
@@ -40,9 +41,17 @@ struct alignas(16) StepOutDev {
 // Device scratch of the step (MTP bridge/AR bookkeeping).
 struct alignas(16) StepScratch {
   int32_t alignment_ids[kStepMaxTokens];  // MTP bridge input tokens
-  int32_t mtp_argmax[kStepMaxTokens];     // per-column MTP draft
+  int32_t mtp_token[kStepMaxTokens];      // per-column MTP draft
   int32_t ar_positions[4];
   int32_t ar_token[4];
+};
+
+// Device-resident distributions the MTP drafts were drawn from. next[i] belongs to
+// out.mtp_drafts[i] and is read by the following step's acceptance; bridge[c] is the bridge
+// column c's (the column of the accepted count becomes next[0]).
+struct alignas(16) StepDraftDists {
+  kernels::DraftDistribution bridge[kStepMaxTokens];
+  kernels::DraftDistribution next[4];
 };
 
 // dst <- src, `bytes` a multiple of 16: step inputs/outputs between device memory and
@@ -65,12 +74,13 @@ void step_set_gdn_commit(const StepOutDev* out, kernels::GdnStepControl* control
 void step_mtp_transition(const StepInDev* in, const StepOutDev* out, int32_t T,
                          StepScratch* scratch, cudaStream_t s);
 
-// dst[0] = src[A] for an FP32 [T][10240] stream tensor (A = out->accepted), and
-// out->mtp_drafts[0] = scratch->ar_token[0] = scratch->mtp_argmax[A].
+// dst[0] = src[A] for an FP32 [T][10240] stream tensor (A = out->accepted),
+// out->mtp_drafts[0] = scratch->ar_token[0] = scratch->mtp_token[A] and
+// dists->next[0] = dists->bridge[A].
 void step_select_accepted(const float* src, StepOutDev* out, float* dst, StepScratch* scratch,
-                          cudaStream_t s);
+                          StepDraftDists* dists, cudaStream_t s);
 
-// After MTP AR step i: out->mtp_drafts[i + 1] = scratch->ar_token[i + 1] = scratch->mtp_argmax[0]
+// After MTP AR step i: out->mtp_drafts[i + 1] = scratch->ar_token[i + 1] = scratch->mtp_token[0]
 // and dst <- src row 0 (the next AR step's hidden).
 void step_ar_advance(const float* src, float* dst, StepOutDev* out, StepScratch* scratch, int32_t i,
                      cudaStream_t s);
@@ -79,8 +89,5 @@ void step_ar_advance(const float* src, float* dst, StepOutDev* out, StepScratch*
 void gather_fp8_rows(const uint8_t* src_codes, const __nv_bfloat16* src_scales, const int32_t* vocab,
                      int32_t rows, int32_t k, uint8_t* dst_codes, __nv_bfloat16* dst_scales,
                      cudaStream_t s);
-
-// ids[i] = vocab[ids[i]] for i < n (n <= 32): draft-vocabulary argmax -> token id.
-void map_draft_ids(const int32_t* vocab, int32_t* ids, int32_t n, cudaStream_t s);
 
 }  // namespace fngine::model

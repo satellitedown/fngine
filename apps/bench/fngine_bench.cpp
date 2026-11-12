@@ -29,11 +29,20 @@ std::string gpu_name(int device) {
     return prop.name;
 }
 
-fngine::RequestOptions benchmark_request(const fngine::bench::BenchTest& test) {
+// `request_index` numbers the benchmark's requests; with --sample it is the request's seed.
+fngine::RequestOptions benchmark_request(const fngine::bench::BenchTest& test,
+                                         const fngine::bench::BenchOptions& options,
+                                         std::uint64_t request_index) {
     fngine::RequestOptions request;
     request.execution.requested_output_tokens = test.requested_output_tokens();
     request.execution.allow_prefix_reuse      = false; // measure full prefill every repetition
-    request.execution.sampling.temperature    = 0.0F;  // deterministic, comparable acceptance
+    if (options.sample) {
+        request.execution.sampling.temperature = options.temperature;
+        request.execution.sampling.top_p       = options.top_p;
+        request.execution.sampling.seed        = request_index;
+    } else {
+        request.execution.sampling.temperature = 0.0F; // deterministic, comparable acceptance
+    }
     request.stop.include_model_defaults       = false; // decode exactly n_gen tokens
     request.output.raw                        = true;
     return request;
@@ -54,12 +63,14 @@ fngine::bench::RepTiming measured_result(const fngine::GenerationResult& result,
 
 fngine::bench::RepTiming run_repetition(fngine::Engine& engine,
                                         const fngine::bench::BenchTest& test,
+                                        const fngine::bench::BenchOptions& options,
+                                        std::uint64_t request_index,
                                         const std::vector<fngine::TokenId>& corpus) {
     const fngine::RuntimeStats before = engine.runtime_stats();
     fngine::PreparedPrompt prompt =
         engine.prepare_tokens(fngine::bench::prompt_slice(corpus, test.n_prompt), false);
     const fngine::GenerationResult result =
-        engine.generate(std::move(prompt), benchmark_request(test));
+        engine.generate(std::move(prompt), benchmark_request(test, options, request_index));
     return measured_result(result, before, engine.runtime_stats());
 }
 
@@ -67,10 +78,7 @@ std::vector<fngine::bench::TestResult>
 run_coding_chat(fngine::Engine& engine, const fngine::bench::BenchOptions& options) {
     std::vector<fngine::bench::TestResult> results{
         {{0, options.n_gen, "coding-turn1"}, {}}, {{0, options.n_gen, "coding-turn2"}, {}}};
-    auto request = benchmark_request(results.front().test);
-    request.output.raw = false;
-    request.execution.sampling.presence_penalty = 0.0F;
-    request.execution.sampling.frequency_penalty = 0.0F;
+    std::uint64_t request_index = 0;
     for (int repetition = -options.warmup; repetition < options.repetitions; ++repetition) {
         fngine::PromptInput input;
         input.messages.reserve(3);
@@ -80,6 +88,10 @@ run_coding_chat(fngine::Engine& engine, const fngine::bench::BenchOptions& optio
             std::cerr << "[fngine-bench] coding chat repetition " << repetition + 1
                       << ", turn " << turn + 1 << '\n';
             const auto before = engine.runtime_stats();
+            auto request = benchmark_request(results.front().test, options, request_index++);
+            request.output.raw = false;
+            request.execution.sampling.presence_penalty = 0.0F;
+            request.execution.sampling.frequency_penalty = 0.0F;
             auto generated = engine.generate(engine.prepare(input), request);
             if (repetition >= 0)
                 results[turn].reps.push_back(measured_result(generated, before, engine.runtime_stats()));
@@ -147,10 +159,12 @@ int main(int argc, char** argv) {
             const auto& test = tests[i];
             std::cerr << "[fngine-bench] test " << (i + 1) << '/' << tests.size() << ' '
                       << test.label << '\n';
-            for (int w = 0; w < options.warmup; ++w) (void)run_repetition(engine, test, corpus);
+            std::uint64_t request_index = 0;
+            for (int w = 0; w < options.warmup; ++w)
+                (void)run_repetition(engine, test, options, request_index++, corpus);
             fngine::bench::TestResult result{test, {}};
             for (int r = 0; r < options.repetitions; ++r) {
-                result.reps.push_back(run_repetition(engine, test, corpus));
+                result.reps.push_back(run_repetition(engine, test, options, request_index++, corpus));
             }
             results.push_back(std::move(result));
         }

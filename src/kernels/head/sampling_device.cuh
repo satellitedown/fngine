@@ -235,4 +235,39 @@ __device__ __forceinline__ int sampling_pick_from_support(const int* cand_idx, c
     return picked;
 }
 
+// thread-0 helper: inverse-CDF pick from the residual max(0, p - q) of speculative sampling,
+// renormalized. p is `prob[0..n)` over cand_idx, q is `q_prob[0..q_n)` over q_idx (ids absent
+// from q have q = 0). `u` is a uniform in [0,1). Returns the chosen vocab id.
+__device__ __forceinline__ int sampling_pick_residual(const int* cand_idx, const float* prob, int n,
+                                                      const std::int32_t* q_idx, const float* q_prob,
+                                                      int q_n, float u) {
+    float residual[kSamplerCandidateCap];
+    float mass = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        float q = 0.0f;
+        for (int t = 0; t < q_n; ++t) {
+            if (q_idx[t] == cand_idx[j]) {
+                q = q_prob[t];
+                break;
+            }
+        }
+        residual[j] = prob[j] > q ? prob[j] - q : 0.0f;
+        mass += residual[j];
+    }
+    if (mass <= 0.0f) {
+        // p <= q everywhere, so p == q and a rejection has probability zero up to rounding.
+        return cand_idx[0];
+    }
+    const float goal = u * mass;
+    float acc        = 0.0f;
+    int picked       = cand_idx[0];
+    for (int j = 0; j < n; ++j) {
+        if (!(residual[j] > 0.0f)) { continue; }
+        acc += residual[j];
+        picked = cand_idx[j];
+        if (goal < acc) { return picked; }
+    }
+    return picked;
+}
+
 } // namespace fngine::kernels

@@ -7,7 +7,9 @@
 //      committed blocks equal a plain T=1 decode of the same committed tokens within 1e-3 relative;
 //   4. session restore: a snapshot taken mid-prompt and restored after 64 decoded tokens gives
 //      byte-identical state and the identical greedy continuation (the engine-level reuse test
-//      cannot compare outputs: decode-built and prefill-built states legitimately differ).
+//      cannot compare outputs: decode-built and prefill-built states legitimately differ);
+//   5. sampling: MTP drafts verified against the distributions they were drawn from are accepted
+//      more often than MTP drafts verified as fixed tokens.
 // Needs FNGINE_TEST_PACK and ~25 GB VRAM / ~30 GB RAM; returns 77 otherwise.
 #include "common/test_util.h"
 #include "core/device.h"
@@ -31,10 +33,10 @@ namespace {
 
 constexpr int kTokens = 256;
 
-std::vector<int32_t> chat_prompt(const text::Frontend& fe, const std::string& user) {
+std::vector<int32_t> chat_prompt(const text::Frontend& fe, const std::string& user, bool thinking = false) {
   PromptInput in;
   in.messages.push_back({ChatRole::User, user, {}, {}, {}});
-  in.options.enable_thinking = false;
+  in.options.enable_thinking = thinking;
   return fe.prepare(in).token_ids;
 }
 
@@ -89,7 +91,7 @@ SpecRun spec_greedy(model::ModelRuntime& rt, const std::vector<int32_t>& prompt,
     const int k = std::min(choice.k, kTokens - int(r.tokens.size()) - 1);
     const int32_t* proposal = choice.source == engine::SpecSource::Lookup ? look : s.mtp_drafts;
     s = runner.step(r.tokens.back(), std::span<const int32_t>(proposal, std::size_t(k)));
-    controller.record_step(k + 1, s.seconds);
+    controller.record_step(k + 1, s.seconds, 0.0);
     if (nlook) lookup.observe(s.tokens());
     ++r.rounds;
     if (k > 0 && choice.source == engine::SpecSource::Mtp) {
@@ -110,6 +112,39 @@ SpecRun spec_greedy(model::ModelRuntime& rt, const std::vector<int32_t>& prompt,
     }
   }
   r.tokens.resize(kTokens);
+  return r;
+}
+
+// Sampling with all MTP drafts every round. `coupled`: the drafts are declared as the previous
+// step's MTP drafts, so the acceptance uses the distributions they were drawn from. The flat
+// sampling distribution (temperature 1.5 over the top 20) separates the two acceptance rules:
+// a drawn draft d survives with probability p(d) as a fixed token and min(1, p(d)/q(d)) coupled.
+SpecRun spec_sampled(model::ModelRuntime& rt, const std::vector<int32_t>& prompt, bool coupled) {
+  model::StepRunner runner(rt, true, true);
+  kernels::SamplingConfig config;
+  config.temperature = 1.5f;
+  config.top_k = 20;
+  config.seed = 0x5eed;
+  runner.set_sampling(config);
+  rt.reset_sequence();
+  rt.prefill(prompt);
+  SpecRun r;
+  model::StepResult s = runner.first_token(int32_t(prompt.size()));
+  r.tokens.push_back(s.licensed[0]);
+  while (int(r.tokens.size()) < kTokens) {
+    const int k = std::min<int>(s.mtp_count, kTokens - int(r.tokens.size()) - 1);
+    int32_t drafts[model::kMtpDrafts];
+    std::copy(std::begin(s.mtp_drafts), std::end(s.mtp_drafts), drafts);
+    s = runner.step(r.tokens.back(), std::span<const int32_t>(drafts, std::size_t(k)), coupled);
+    ++r.rounds;
+    r.offered += k;
+    r.accepted += s.accepted;
+    if (k > 0) {
+      ++r.first_offered;
+      if (s.accepted >= 1) ++r.first_accepted;
+    }
+    for (int i = 0; i < s.count; ++i) r.tokens.push_back(s.licensed[i]);
+  }
   return r;
 }
 
@@ -208,6 +243,25 @@ int main() {
     std::printf("[check2] MTP first-draft acceptance %.3f (%s >= 0.55)\n", first_rate,
                 first_rate >= 0.55 ? "PASS" : "FAIL");
     ok = ok && first_rate >= 0.55;
+
+    {
+      int offered[2] = {}, accepted[2] = {};
+      for (const std::string& prompt : prompts) {
+        const std::vector<int32_t> ids = chat_prompt(fe, prompt, true);
+        for (int coupled = 0; coupled < 2; ++coupled) {
+          const SpecRun run = spec_sampled(rt, ids, coupled != 0);
+          offered[coupled] += run.first_offered;
+          accepted[coupled] += run.first_accepted;
+        }
+      }
+      const double fixed = double(accepted[0]) / std::max(1, offered[0]);
+      const double coupled = double(accepted[1]) / std::max(1, offered[1]);
+      const bool pass5 = coupled > fixed + 0.1;
+      std::printf("[check5] sampled first MTP draft accepted: %.3f against its distribution (%d of %d), "
+                  "%.3f as a fixed token (%d of %d) -> %s\n",
+                  coupled, accepted[1], offered[1], fixed, accepted[0], offered[0], pass5 ? "PASS" : "FAIL");
+      ok = ok && pass5;
+    }
 
     // A previously captured MTP graph must not write drafts beyond the final cache page.
     // The target still processes every remaining position; only unusable proposals stop.

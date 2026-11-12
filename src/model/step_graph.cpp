@@ -7,6 +7,7 @@
 #include "kernels/head/head.h"
 #include "kernels/ple/ple.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -20,7 +21,7 @@ constexpr std::size_t kAlign = 256;
 constexpr std::size_t align_up(std::size_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 
 struct DevLayout {
-  std::size_t in, out, scratch, config, counts, x_ar, total;
+  std::size_t in, out, scratch, dists, config, counts, x_ar, total;
 };
 
 DevLayout dev_layout() {
@@ -29,12 +30,16 @@ DevLayout dev_layout() {
   l.in = off;      off = align_up(off + sizeof(StepInDev));
   l.out = off;     off = align_up(off + sizeof(StepOutDev));
   l.scratch = off; off = align_up(off + sizeof(StepScratch));
+  l.dists = off;   off = align_up(off + sizeof(StepDraftDists));
   l.config = off;  off = align_up(off + sizeof(k::SamplingConfig));
   l.counts = off;  off = align_up(off + sizeof(int32_t) * dims::kVocab);
   l.x_ar = off;    off = align_up(off + sizeof(float) * dims::kStreamHidden);
   l.total = off;
   return l;
 }
+
+// A draft's RNG position is its own: two past the bridge column (or AR step) that drafts it.
+constexpr int32_t kDraftPositionOffset = 2;
 
 }  // namespace
 
@@ -48,6 +53,7 @@ StepRunner::StepRunner(ModelRuntime& rt, bool use_graphs, bool mtp, bool logit_d
   in_dev_ = reinterpret_cast<StepInDev*>(b + l.in);
   out_dev_ = reinterpret_cast<StepOutDev*>(b + l.out);
   scratch_ = reinterpret_cast<StepScratch*>(b + l.scratch);
+  dists_ = reinterpret_cast<StepDraftDists*>(b + l.dists);
   config_dev_ = reinterpret_cast<k::SamplingConfig*>(b + l.config);
   token_counts_ = reinterpret_cast<int32_t*>(b + l.counts);
   x_ar_ = reinterpret_cast<float*>(b + l.x_ar);
@@ -75,7 +81,8 @@ void StepRunner::reset_graphs() {
 }
 
 // MTP bridge over T columns (hidden x_src rows, tokens = scratch alignment ids, positions =
-// in.positions) and two autoregressive draft steps. Leaves d1..d3 in out.mtp_drafts.
+// in.positions) and two autoregressive draft steps. Leaves d1..d3 in out.mtp_drafts and the
+// distributions they were drawn from in dists.next.
 void StepRunner::enqueue_mtp(int32_t T, const float* x_src, cudaStream_t s) {
   Forward& fwd = rt_.forward();
   Workspace& ws = rt_.ws();
@@ -89,8 +96,8 @@ void StepRunner::enqueue_mtp(int32_t T, const float* x_src, cudaStream_t s) {
   bio.pass = T == 1 ? Pass::Decode : Pass::Verify;
   fwd.mtp_layer(x_src, bio, s);
   fwd.final_mixer(m.mixer, ws.X_mtp, T, ws.mix, s);
-  draft_logits_argmax(T, s);
-  step_select_accepted(ws.X_mtp, out_dev_, x_ar_, scratch_, s);
+  draft_tokens(T, in_dev_->positions, 0, dists_->bridge, s);
+  step_select_accepted(ws.X_mtp, out_dev_, x_ar_, scratch_, dists_, s);
   for (int32_t i = 0; i + 1 < kMtpDrafts; ++i) {
     StepIo aio;
     aio.T = 1;
@@ -100,25 +107,32 @@ void StepRunner::enqueue_mtp(int32_t T, const float* x_src, cudaStream_t s) {
     aio.pass = Pass::Decode;
     fwd.mtp_layer(x_ar_, aio, s);
     fwd.final_mixer(m.mixer, ws.X_mtp, 1, ws.mix, s);
-    draft_logits_argmax(1, s);
+    // d1..d(i+1) precede this draft and are not in the token counts.
+    draft_tokens(1, &scratch_->ar_positions[i], i + 1, &dists_->next[i + 1], s);
     step_ar_advance(ws.X_mtp, x_ar_, out_dev_, scratch_, i, s);
   }
 }
 
-// MTP drafts: argmax over the draft-vocabulary head when the pack provides one (then mapped back
-// to token ids), over the full lm_head otherwise.
-void StepRunner::draft_logits_argmax(int32_t rows, cudaStream_t s) {
+// MTP drafts for `rows` rows of ws.mix into scratch.mtp_token: over the draft-vocabulary head
+// when the pack provides one, over the full lm_head otherwise. Greedy requests take the argmax;
+// sampling requests draw the draft from the head's truncated distribution, which the next
+// step's acceptance reads from `dist` (kernels::sample_drafts). The penalty overlay is
+// out.mtp_drafts[0..overlay_len).
+void StepRunner::draft_tokens(int32_t rows, const int32_t* positions, int32_t overlay_len,
+                              k::DraftDistribution* dist, cudaStream_t s) {
   Forward& fwd = rt_.forward();
   Workspace& ws = rt_.ws();
   const DenseWeights& w = rt_.weights();
-  if (w.draft_head().codes) {
+  const bool head = w.draft_head().codes != nullptr;
+  const int32_t n = head ? w.draft_head().n : dims::kVocab;
+  if (head) {
     fwd.draft_head(ws.mix, rows, ws.logits, s);
-    k::argmax(ws.logits, rows, w.draft_head().n, scratch_->mtp_argmax, s, w.draft_head().n);
-    map_draft_ids(w.draft_vocab(), scratch_->mtp_argmax, rows, s);
   } else {
     fwd.lm_head(ws.mix, rows, ws.logits, s);
-    k::argmax(ws.logits, rows, dims::kVocab, scratch_->mtp_argmax, s);
   }
+  k::sample_drafts(ws.logits, rows, n, n, head ? w.draft_vocab() : nullptr, config_dev_, positions,
+                   kDraftPositionOffset, &in_dev_->seq, out_dev_->mtp_drafts, overlay_len,
+                   scratch_->mtp_token, dist, ws.sample_ws, ws.sample_ws_bytes, s);
 }
 
 void StepRunner::enqueue_step(int32_t T, cudaStream_t s, bool draft) {
@@ -148,7 +162,7 @@ void StepRunner::enqueue_step(int32_t T, cudaStream_t s, bool draft) {
     k::speculative_accept(out_dev_->target, ws.logits, in_dev_->drafts, &in_dev_->k, T - 1,
                           dims::kVocab, config_dev_, &out_dev_->length, &out_dev_->anchor,
                           out_dev_->licensed, &out_dev_->licensed_count, &out_dev_->accepted,
-                          ws.accept_ws, ws.accept_ws_bytes, s);
+                          ws.accept_ws, ws.accept_ws_bytes, s, dists_->next, &in_dev_->draft_kind);
     step_set_gdn_commit(out_dev_, st.gdn_control(), s);
     // The folds only feed the next step and the MTP drafts touch neither GDN nor PLE state, so
     // they run beside the drafts. The fold moves ~226 MB (state read + write); 64 CTAs spread that
@@ -164,7 +178,7 @@ void StepRunner::enqueue_step(int32_t T, cudaStream_t s, bool draft) {
   step_copy(out_mapped_, out_dev_, sizeof(StepOutDev), s);
 }
 
-StepResult StepRunner::finish(double seconds, bool draft) const {
+StepResult StepRunner::finish(double seconds, bool draft) {
   StepResult r;
   r.count = out_host_->licensed_count;
   r.accepted = out_host_->accepted;
@@ -175,6 +189,8 @@ StepResult StepRunner::finish(double seconds, bool draft) const {
   if (logit_diagnostics_)
     std::memcpy(r.target_gap, out_host_->target_gap, sizeof(float) * std::size_t(r.count));
   r.seconds = seconds;
+  last_mtp_count_ = r.mtp_count;
+  std::copy(std::begin(r.mtp_drafts), std::end(r.mtp_drafts), last_mtp_.begin());
   return r;
 }
 
@@ -212,7 +228,7 @@ StepResult StepRunner::first_token(int32_t length) {
   return finish(secs, draft);
 }
 
-StepResult StepRunner::step(int32_t anchor, std::span<const int32_t> drafts) {
+StepResult StepRunner::step(int32_t anchor, std::span<const int32_t> drafts, bool mtp_drafts) {
   const int32_t k = int32_t(drafts.size());
   const int32_t T = k + 1;
   if (T > dims::kMaxGraphWidth) throw std::invalid_argument("step: too many drafts");
@@ -236,6 +252,10 @@ StepResult StepRunner::step(int32_t anchor, std::span<const int32_t> drafts) {
   in_host_->k = k;
   in_host_->length = p0;
   in_host_->seq = seq;
+  // The stored distributions belong to the previous result's drafts; anything else is verified
+  // as a fixed (one-hot) proposal.
+  in_host_->draft_kind = mtp_drafts && k > 0 && k <= last_mtp_count_ &&
+                         std::equal(drafts.begin(), drafts.end(), last_mtp_.begin());
 
   // Capture before timing: the controller's latency model must see steady-state step cost; a
   // first-use capture would make that width look many times slower than it is.
@@ -249,14 +269,20 @@ StepResult StepRunner::step(int32_t anchor, std::span<const int32_t> drafts) {
   }
   const auto t0 = std::chrono::steady_clock::now();
   rt_.pool().begin(seq, cpu::PoolMode::Decode);
+  const auto stage_rows = [&] {
+    rt_.ngram().gather_tokens(in_host_->tokens, T, rt_.ngram_history(), rt_.ple_staging_host());
+    host_store_release(rt_.exchange_host()->control.ple_ready.value, seq);
+  };
   if (graph) {
     graphs_[std::size_t(T)]->launch(s);
+    // n-gram rows for this step, staged while the first layers run.
+    stage_rows();
   } else {
+    // Eager launches fill the stream's queue behind the PLE kernel's wait for the rows and then
+    // block this thread, so the rows are staged first.
+    stage_rows();
     enqueue_step(T, s, draft);
   }
-  // n-gram rows for this step, staged while the first layers run.
-  rt_.ngram().gather_tokens(in_host_->tokens, T, rt_.ngram_history(), rt_.ple_staging_host());
-  host_store_release(rt_.exchange_host()->control.ple_ready.value, seq);
   // After the rows: swap copies through pageable staging can block this thread.
   rt_.overlap_swaps();
   CUDA_CHECK(cudaStreamSynchronize(s));

@@ -206,7 +206,9 @@ private:
     void start_runtime();
     void process(RequestState& request);
     void publish_stats();
-    void account_decode_step(std::int32_t width, std::int32_t licensed);
+    // Decode accounting of one decode/verify step. Returns the CPU expert tier's compute time
+    // (seconds, summed over the layers).
+    double account_decode_step(std::int32_t width, std::int32_t licensed);
     // Re-reads the cumulative pool counters so that decode accounting excludes prefill work.
     void sync_pool_counters();
 
@@ -483,14 +485,16 @@ void Engine::Impl::sync_pool_counters() {
     }
 }
 
-void Engine::Impl::account_decode_step(std::int32_t width, std::int32_t licensed) {
+double Engine::Impl::account_decode_step(std::int32_t width, std::int32_t licensed) {
     const auto layer_timings = rt_->pool().timings();
     std::uint64_t cold       = 0;
+    double cpu_ns            = 0.0;
     for (int l = 0; l < kLayers; ++l) {
         const auto& t   = layer_timings[std::size_t(l)];
         cold           += t.pairs - pool_pairs_[std::size_t(l)];
-        decode_wait_ns_[std::size_t(l)] +=
-            static_cast<double>(t.compute_ns - pool_compute_[std::size_t(l)]);
+        const auto layer_ns = static_cast<double>(t.compute_ns - pool_compute_[std::size_t(l)]);
+        cpu_ns += layer_ns;
+        decode_wait_ns_[std::size_t(l)] += layer_ns;
         pool_pairs_[std::size_t(l)]   = t.pairs;
         pool_compute_[std::size_t(l)] = t.compute_ns;
     }
@@ -512,6 +516,7 @@ void Engine::Impl::account_decode_step(std::int32_t width, std::int32_t licensed
     decode_mass_ += static_cast<double>(width) * kLayers;
     ++local_.decode_steps;
     local_.committed_decode_tokens += static_cast<std::uint64_t>(licensed);
+    return cpu_ns * 1e-9;
 }
 
 void Engine::Impl::process(RequestState& rq) {
@@ -692,8 +697,22 @@ void Engine::Impl::process(RequestState& rq) {
                                     options.speculative.backend == SpeculativeBackend::Lookup;
         result.speculative.accepted_per_position.assign(kMaxPositionStats, 0);
         const auto t_decode = Clock::now();
+        // A step is timed with the drawing of the next MTP drafts inside. Its latency reaches
+        // the controller only after the decision about those drafts, so that whether sampled
+        // drafts are offered cannot depend on what was drawn (model::StepRunner::step).
+        struct {
+            int width      = 0;
+            double seconds = 0.0, cpu_seconds = 0.0;
+        } timed;
+        const auto record_timed = [&] {
+            if (timed.width > 0) {
+                controller_->record_step(timed.width, timed.seconds, timed.cpu_seconds);
+            }
+            timed.width = 0;
+        };
         while (!decision.finished()) {
             if (decision.continuation == text::ContinuationAction::ApplyTargetControl) {
+                record_timed();
                 const auto control_span = session.pending_control_tokens();
                 const std::vector<TokenId> control(control_span.begin(), control_span.end());
                 std::vector<TokenId> forced{anchor};
@@ -701,8 +720,7 @@ void Engine::Impl::process(RequestState& rq) {
                 for (const TokenId token : forced) {
                     if (rt_->position() + 1 > capacity) break;
                     const model::StepResult r = runner_->step(token, {});
-                    account_decode_step(1, 0);
-                    controller_->record_step(1, r.seconds);
+                    controller_->record_step(1, r.seconds, account_decode_step(1, 0));
                 }
                 seq_.insert(seq_.end(), control.begin(), control.end());
                 const auto remaining = static_cast<std::uint32_t>(effective - generated.size());
@@ -741,6 +759,7 @@ void Engine::Impl::process(RequestState& rq) {
             }
             const engine::SpecDecision choice =
                 controller_->decide(std::min(mtp_available, kmax), look_n, look_p);
+            record_timed();
             std::span<const std::int32_t> drafts;
             if (choice.source == engine::SpecSource::Mtp) {
                 drafts = std::span<const std::int32_t>(mtp_drafts.data(), std::size_t(choice.k));
@@ -748,10 +767,10 @@ void Engine::Impl::process(RequestState& rq) {
                 drafts = std::span<const std::int32_t>(look.data(), std::size_t(choice.k));
             }
 
-            const model::StepResult r = runner_->step(anchor, drafts);
+            const model::StepResult r =
+                runner_->step(anchor, drafts, choice.source == engine::SpecSource::Mtp);
             const int width           = 1 + choice.k;
-            controller_->record_step(width, r.seconds);
-            account_decode_step(width, r.count);
+            timed                     = {width, r.seconds, account_decode_step(width, r.count)};
             if (look_n > 0) lookup_.observe(r.tokens());
             ++result.speculative.rounds;
             switch (choice.source) {
@@ -792,6 +811,7 @@ void Engine::Impl::process(RequestState& rq) {
             decision      = feed(licensed);
             if (local_.decode_steps % 32 == 0) publish_stats();
         }
+        record_timed();
         const auto t_end = Clock::now();
         result.timings.decode_seconds          = seconds_between(t_decode, t_end);
         result.timings.generation_wall_seconds = seconds_between(t_first, t_end);

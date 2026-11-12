@@ -111,18 +111,20 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
 // Commits the round's accepted tokens plus one correction/bonus token, then advances the
 // length. Greedy (temperature <= 0) keeps the longest draft prefix whose target argmax matches,
 // then takes the target argmax at the divergence column. Sampling (temperature > 0) runs
-// distribution-correct speculative rejection sampling with a one-hot (greedy) draft: accept
-// drafts[i] with probability p_i(drafts[i]) under the truncated target distribution, resample
-// from the masked residual on the first rejection, and draw a bonus from the last column when
-// every draft accepts. Each (group, column) block merges its tiles; the last group of a column
-// publishes the column distribution, and the last column to finish performs the sequential
-// accept/commit.
+// distribution-correct speculative sampling: drafts[i], drawn from q_i, is accepted with
+// probability min(1, p_i(drafts[i]) / q_i(drafts[i])) under the truncated target distribution
+// p_i; the first rejection resamples from max(0, p_i - q_i); a bonus is drawn from the last
+// column when every draft accepts. q_i is draft_dist[i] for drafts drawn by sample_drafts()
+// and one-hot otherwise. Each (group, column) block merges its tiles; the last group of a
+// column publishes the column distribution, and the last column to finish performs the
+// sequential accept/commit.
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
     const std::int32_t* target_tokens, const std::int32_t* drafts,
     const std::int32_t* current_extent, std::int32_t* length, std::int32_t* anchor,
     std::int32_t* licensed_tokens, std::int32_t* licensed_count, std::int32_t* accepted,
     const SamplingConfig* config, std::int32_t token_domain, std::int32_t k,
-    std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace) {
+    std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace,
+    const DraftDistribution* draft_dist, const std::int32_t* draft_kind) {
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
     const int tid   = threadIdx.x;
@@ -250,9 +252,10 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
         const int done_cols = atomicAdd(workspace.speculative_finalize_count, 1) + 1;
         if (done_cols == extent + 1) {
             __threadfence();
-            const int L = *length;
-            int a       = 0;
-            int tstar   = 0;
+            const int L        = *length;
+            const bool coupled = draft_dist != nullptr && draft_kind != nullptr && *draft_kind != 0;
+            int a              = 0;
+            int tstar          = 0;
             for (int i = 0; i <= extent; ++i) {
                 const int n            = workspace.dist_support[i];
                 const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
@@ -266,15 +269,34 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                             break;
                         }
                     }
+                    // q(d) of the distribution the draft was drawn from; one-hot (q(d) = 1) for a
+                    // fixed draft, or when the stored distribution does not hold the draft.
+                    const DraftDistribution* q = nullptr;
+                    float qd                   = 1.0f;
+                    if (coupled) {
+                        const DraftDistribution& dd = draft_dist[i];
+                        const int q_n = dd.n < kDraftSupport ? dd.n : kDraftSupport;
+                        for (int j = 0; j < q_n; ++j) {
+                            if (dd.ids[j] == d && dd.probs[j] > 0.0f) {
+                                q  = &dd;
+                                qd = dd.probs[j];
+                                break;
+                            }
+                        }
+                    }
                     const float u =
                         sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeSpeculativeAccept, 0u);
-                    if (u < pd) {
+                    if (u * qd < pd) {
                         a = i + 1;
                         continue;
                     }
                     const float ur = sampling_uniform(cfg.seed, L + i + 1,
                                                       kSamplePurposeSpeculativeCorrection, 0u);
-                    tstar          = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+                    tstar = q != nullptr
+                                ? sampling_pick_residual(dist_idx, dist_prob, n, q->ids, q->probs,
+                                                         q->n < kDraftSupport ? q->n : kDraftSupport,
+                                                         ur)
+                                : sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
                     break;
                 }
                 const float u =
@@ -322,7 +344,8 @@ void speculative_accept(const std::int32_t* target_tokens, const float* logits,
                         std::int32_t* length, std::int32_t* anchor,
                         std::int32_t* licensed_tokens, std::int32_t* licensed_count,
                         std::int32_t* accepted, void* workspace, std::size_t workspace_bytes,
-                        cudaStream_t stream) {
+                        cudaStream_t stream, const DraftDistribution* draft_dist,
+                        const std::int32_t* draft_kind) {
     check_drafts(token_domain, k, "speculative_accept");
     const std::int32_t cols              = k + 1;
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, cols);
@@ -340,7 +363,8 @@ void speculative_accept(const std::int32_t* target_tokens, const float* logits,
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(cols));
     speculative_sampling_group_finalize_kernel<<<group_grid, kSamplerGroupBlock, 0, stream>>>(
         target_tokens, drafts, current_extent, length, anchor, licensed_tokens, licensed_count,
-        accepted, config, token_domain, k, partial_blocks, groups, scratch);
+        accepted, config, token_domain, k, partial_blocks, groups, scratch, draft_dist,
+        draft_kind);
     CUDA_CHECK(cudaGetLastError());
 }
 

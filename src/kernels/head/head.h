@@ -28,9 +28,10 @@ void embed_gather(const __nv_bfloat16* table, const std::int32_t* tokens, std::i
 
 // ---------------------------------------------------------------- argmax
 
-// out[t] = min argmax_{v < token_domain} logits[t * row_stride + v] (ties go to the lower id).
+// out[t] = min argmax_{v < token_domain} logits[t][v] over FP32 [T][248320] logits (ties go to
+// the lower id).
 void argmax(const float* logits, std::int32_t T, std::int32_t token_domain, std::int32_t* out,
-            cudaStream_t stream, std::int32_t row_stride = dims::kVocab);
+            cudaStream_t stream);
 
 // ---------------------------------------------------------------- sampling
 
@@ -41,6 +42,7 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeAccept     = 2,
     kSamplePurposeSpeculativeCorrection = 3,
     kSamplePurposeSpeculativeBonus      = 4,
+    kSamplePurposeDraft                 = 5,
 };
 
 // Device-resident sampling parameters. token_counts is an optional device I32 [vocab]
@@ -77,6 +79,36 @@ void sample(const float* logits, std::int32_t T, std::int32_t token_domain,
             const SamplingConfig* config, const std::int32_t* positions, std::int32_t purpose,
             std::int32_t* out, void* workspace, std::size_t workspace_bytes, cudaStream_t stream);
 
+// The truncated distribution a draft token was drawn from (token ids, descending probability).
+// n == 0: the draft is a fixed choice (an argmax or a looked-up token), a one-hot proposal.
+inline constexpr std::int32_t kDraftSupport = 20;
+struct alignas(16) DraftDistribution {
+    std::int32_t n = 0;
+    std::int32_t ids[kDraftSupport] = {};
+    float probs[kDraftSupport]      = {};
+};
+
+/**
+ * Draft tokens from draft-head logits FP32 [rows][row_stride] over `token_domain` draft rows;
+ * `id_map` (device I32 [token_domain], or null for the identity) gives the token of each row,
+ * which is what token_counts and the penalty overlay refer to. Row r's overlay is
+ * overlay[0..overlay_len): tokens that precede the draft and are not yet in token_counts.
+ *   temperature <= 0: out[r] = token of the penalty-adjusted row argmax; dist[r].n = 0.
+ *   Otherwise: row r's truncated distribution q_r (sample() rules) is stored in dist[r] and
+ *     out[r] is drawn from it with the counter RNG keyed by
+ *     (seed, positions[r] + position_offset, kSamplePurposeDraft, *draw). `draw` (device U32,
+ *     or null for 0) separates repeated draws for one position: a draft redrawn after a
+ *     rejection is then independent of the discarded one.
+ * token_counts are read, never incremented. positions is device I32 [rows]; out is device I32
+ * [rows]; dist is device [rows]. The workspace is sample()'s.
+ */
+void sample_drafts(const float* logits, std::int32_t rows, std::int32_t token_domain,
+                   std::int32_t row_stride, const std::int32_t* id_map, const SamplingConfig* config,
+                   const std::int32_t* positions, std::int32_t position_offset,
+                   const std::uint32_t* draw, const std::int32_t* overlay,
+                   std::int32_t overlay_len, std::int32_t* out, DraftDistribution* dist,
+                   void* workspace, std::size_t workspace_bytes, cudaStream_t stream);
+
 // token_counts[token_ids[i]] += 1 for i < count (device arrays).
 void increment_token_counts(const std::int32_t* token_ids, std::int32_t count,
                             std::int32_t* token_counts, cudaStream_t stream);
@@ -106,14 +138,21 @@ void speculative_prepare_verify_inputs(const std::int32_t* anchor, const std::in
  *     (penalty-adjusted; without penalties target_tokens[i], the raw argmax, is used), terminal
  *     = argmax of column A.
  *   Sampling: column i's truncated distribution p_i (sample() rules, penalty overlay =
- *     drafts[0..i)) accepts drafts[i] when u < p_i(drafts[i]) (one-hot proposal) with
- *     u = rng(seed, L+i+1, SpeculativeAccept); on the first rejection the terminal is drawn
- *     from p_i with drafts[i] removed (rng purpose SpeculativeCorrection); when all P drafts
- *     are accepted the terminal is drawn from p_P (purpose SpeculativeBonus, position L+P+1).
+ *     drafts[0..i)) accepts drafts[i] when u q_i(drafts[i]) < p_i(drafts[i]) with
+ *     u = rng(seed, L+i+1, SpeculativeAccept), where q_i is the distribution the draft was drawn
+ *     from: draft_dist[i] when `draft_dist` is set, *draft_kind != 0 and its n > 0 and it
+ *     holds the draft; otherwise one-hot (q_i(drafts[i]) = 1). On the first rejection the
+ *     terminal is drawn from max(0, p_i - q_i) normalized (one-hot: p_i with drafts[i] removed;
+ *     rng purpose SpeculativeCorrection); when all P drafts are accepted the terminal is drawn
+ *     from p_P (purpose SpeculativeBonus, position L+P+1). Every emitted token is then
+ *     distributed as its p_i: speculative sampling (Leviathan et al.), with acceptance
+ *     probability sum_x min(p_i(x), q_i(x)). The one-hot rule is valid for any draft chosen
+ *     independently of this call's random numbers.
  * L = *length before the call. Effects: licensed_tokens[0..A) = accepted drafts,
  * licensed_tokens[A] = terminal, rest 0 (device I32 [k+1]); *licensed_count = A+1;
  * *accepted = A; *anchor = terminal; *length += A+1; token_counts (if any) += emitted tokens.
  * target_tokens is device I32 [k+1] (argmax() of the logits; read only on the raw-greedy path).
+ * draft_dist (device [k]) and draft_kind (device I32) may both be null.
  */
 void speculative_accept(const std::int32_t* target_tokens, const float* logits,
                         const std::int32_t* drafts, const std::int32_t* current_extent,
@@ -121,7 +160,8 @@ void speculative_accept(const std::int32_t* target_tokens, const float* logits,
                         std::int32_t* length, std::int32_t* anchor,
                         std::int32_t* licensed_tokens, std::int32_t* licensed_count,
                         std::int32_t* accepted, void* workspace, std::size_t workspace_bytes,
-                        cudaStream_t stream);
+                        cudaStream_t stream, const DraftDistribution* draft_dist = nullptr,
+                        const std::int32_t* draft_kind = nullptr);
 
 /**
  * MTP round transition after acceptance (k = verify width - 1, A = clamp(*accepted, 0, k)):

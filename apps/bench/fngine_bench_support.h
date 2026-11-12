@@ -48,6 +48,11 @@ struct BenchOptions {
     std::filesystem::path corpus_root{std::string(kDefaultCorpusRoot)};
     bool ctx_explicit   = false;
     bool coding_chat    = false;
+    // Decode with sampling (the model's default preset unless overridden) instead of greedy;
+    // every measured request gets its own fixed seed.
+    bool sample = false;
+    std::optional<float> temperature;
+    std::optional<float> top_p;
     OutputFormat output = OutputFormat::Table;
     std::filesystem::path output_file;
     bool help_requested = false;

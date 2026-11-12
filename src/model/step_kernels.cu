@@ -57,15 +57,20 @@ __global__ void mtp_transition_kernel(const StepInDev* in, const StepOutDev* out
 }
 
 __global__ void select_accepted_kernel(const float* src, StepOutDev* out, float* dst,
-                                       StepScratch* scratch) {
+                                       StepScratch* scratch, StepDraftDists* dists) {
   const int32_t A = out->accepted;
   const float4* s = reinterpret_cast<const float4*>(src + std::size_t(A) * dims::kStreamHidden);
   float4* d = reinterpret_cast<float4*>(dst);
   for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < dims::kStreamHidden / 4;
        i += blockDim.x * gridDim.x)
     d[i] = s[i];
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    const int32_t tok = scratch->mtp_argmax[A];
+  if (blockIdx.x != 0) return;
+  constexpr int kWords = int(sizeof(kernels::DraftDistribution) / sizeof(int32_t));
+  if (int(threadIdx.x) < kWords)
+    reinterpret_cast<int32_t*>(&dists->next[0])[threadIdx.x] =
+        reinterpret_cast<const int32_t*>(&dists->bridge[A])[threadIdx.x];
+  if (threadIdx.x == 0) {
+    const int32_t tok = scratch->mtp_token[A];
     out->mtp_drafts[0] = tok;
     scratch->ar_token[0] = tok;
   }
@@ -79,7 +84,7 @@ __global__ void ar_advance_kernel(const float* src, float* dst, StepOutDev* out,
        t += blockDim.x * gridDim.x)
     d[t] = s[t];
   if (blockIdx.x == 0 && threadIdx.x == 0) {
-    const int32_t tok = scratch->mtp_argmax[0];
+    const int32_t tok = scratch->mtp_token[0];
     out->mtp_drafts[i + 1] = tok;
     scratch->ar_token[i + 1] = tok;
   }
@@ -94,11 +99,6 @@ __global__ void gather_rows_kernel(const uint8_t* src_codes, const __nv_bfloat16
   auto* d = reinterpret_cast<uint4*>(dst_codes + std::size_t(row) * k);
   for (int i = threadIdx.x; i < k / 16; i += blockDim.x) d[i] = s[i];
   if (threadIdx.x == 0) dst_scales[row] = src_scales[src];
-}
-
-__global__ void map_ids_kernel(const int32_t* vocab, int32_t* ids, int32_t n) {
-  const int i = threadIdx.x;
-  if (i < n) ids[i] = vocab[ids[i]];
 }
 
 }  // namespace
@@ -131,8 +131,8 @@ void step_mtp_transition(const StepInDev* in, const StepOutDev* out, int32_t T,
 }
 
 void step_select_accepted(const float* src, StepOutDev* out, float* dst, StepScratch* scratch,
-                          cudaStream_t s) {
-  select_accepted_kernel<<<10, 256, 0, s>>>(src, out, dst, scratch);
+                          StepDraftDists* dists, cudaStream_t s) {
+  select_accepted_kernel<<<10, 256, 0, s>>>(src, out, dst, scratch, dists);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -147,11 +147,6 @@ void gather_fp8_rows(const uint8_t* src_codes, const __nv_bfloat16* src_scales, 
                      cudaStream_t s) {
   if (k % 16 != 0) throw std::invalid_argument("gather_fp8_rows: k must be a multiple of 16");
   gather_rows_kernel<<<rows, 128, 0, s>>>(src_codes, src_scales, vocab, k, dst_codes, dst_scales);
-  CUDA_CHECK(cudaGetLastError());
-}
-
-void map_draft_ids(const int32_t* vocab, int32_t* ids, int32_t n, cudaStream_t s) {
-  map_ids_kernel<<<1, 32, 0, s>>>(vocab, ids, n);
   CUDA_CHECK(cudaGetLastError());
 }
 

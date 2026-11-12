@@ -47,7 +47,11 @@ class StepRunner {
 
   // One decode (k = 0) or verify step: tokens [anchor, drafts[0..k)] at positions
   // rt.position() .. +k. Commits the licensed tokens into the runtime (position/history).
-  StepResult step(int32_t anchor, std::span<const int32_t> drafts);
+  // `mtp_drafts`: the drafts are the first k MTP drafts of the previous result, in order; a
+  // sampling request then accepts them against the distributions they were drawn from
+  // (kernels::speculative_accept). The caller must choose them without looking at them:
+  // offering the previous MTP drafts only for some of their values would bias the output.
+  StepResult step(int32_t anchor, std::span<const int32_t> drafts, bool mtp_drafts = false);
 
   // Drops captured graphs (e.g. after the KV/state buffers were reallocated).
   void reset_graphs();
@@ -55,8 +59,9 @@ class StepRunner {
  private:
   void enqueue_step(int32_t T, cudaStream_t s, bool draft);
   void enqueue_mtp(int32_t T, const float* x_src, cudaStream_t s);
-  void draft_logits_argmax(int32_t rows, cudaStream_t s);
-  StepResult finish(double seconds, bool draft) const;
+  void draft_tokens(int32_t rows, const int32_t* positions, int32_t overlay_len,
+                    kernels::DraftDistribution* dist, cudaStream_t s);
+  StepResult finish(double seconds, bool draft);
 
   ModelRuntime& rt_;
   bool use_graphs_;
@@ -67,6 +72,7 @@ class StepRunner {
   StepInDev* in_dev_ = nullptr;
   StepOutDev* out_dev_ = nullptr;
   StepScratch* scratch_ = nullptr;
+  StepDraftDists* dists_ = nullptr;
   kernels::SamplingConfig* config_dev_ = nullptr;
   int32_t* token_counts_ = nullptr;
   float* x_ar_ = nullptr;
@@ -74,6 +80,8 @@ class StepRunner {
   StepOutDev* out_host_ = nullptr;
   const StepInDev* in_mapped_ = nullptr;  // device aliases of in_host_ / out_host_
   StepOutDev* out_mapped_ = nullptr;
+  std::array<int32_t, kMtpDrafts> last_mtp_{};  // drafts of the previous result (dists_->next)
+  int32_t last_mtp_count_ = 0;
   std::array<std::unique_ptr<DecodeGraphExecutable>, kStepMaxTokens + 1> graphs_{};
 };
 

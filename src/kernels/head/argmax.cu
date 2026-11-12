@@ -96,16 +96,16 @@ __launch_bounds__(kArgmaxBlock) __global__
 } // namespace
 
 void argmax(const float* logits, std::int32_t T, std::int32_t token_domain, std::int32_t* out,
-            cudaStream_t stream, std::int32_t row_stride) {
+            cudaStream_t stream) {
     if (T == 0) { return; }
-    if (token_domain <= 0 || token_domain > dims::kVocab || row_stride < token_domain) {
-        throw std::invalid_argument("argmax: token_domain must be in [1, 248320] and <= row_stride");
+    if (token_domain <= 0 || token_domain > dims::kVocab) {
+        throw std::invalid_argument("argmax: token_domain must be in [1, 248320]");
     }
     const int block        = T <= kArgmaxWideColumns ? kArgmaxBlock : kArgmaxWideBlock;
     const int tiled_blocks = div_up(token_domain, block * kArgmaxItemsPerThread);
     CUDA_CHECK(cudaMemsetAsync(out, 0, static_cast<std::size_t>(T) * sizeof(std::int32_t), stream));
     const dim3 grid(static_cast<unsigned int>(tiled_blocks), static_cast<unsigned int>(T));
-    argmax_tiled_atomic_kernel<<<grid, block, 0, stream>>>(logits, out, token_domain, row_stride);
+    argmax_tiled_atomic_kernel<<<grid, block, 0, stream>>>(logits, out, token_domain, dims::kVocab);
     CUDA_CHECK(cudaGetLastError());
 }
 

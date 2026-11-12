@@ -159,6 +159,10 @@ std::string usage_text(std::string_view program) {
         << "  --corpus-root <dir>         text corpus root when --corpus is absent (default "
         << kDefaultCorpusRoot << ")\n"
         << "  --coding-chat              two linked-list coding turns instead of the corpus\n"
+        << "  --sample                   sample (model default preset, one fixed seed per request)\n"
+        << "                             instead of greedy decoding\n"
+        << "  --temperature <f>          with --sample: temperature override\n"
+        << "  --top-p <f>                with --sample: top-p override\n"
         << "  -o, --output <table|json>   output format (default table)\n"
         << "  -f, --output-file <path>    also write the report to a file\n"
         << "  -h, --help                  show this help\n\nEngine:\n"
@@ -199,6 +203,12 @@ BenchOptions parse_args(int argc, char** argv) {
             options.warmup = parse_nonnegative(value("--warmup"), "warmup");
         } else if (arg == "--coding-chat") {
             options.coding_chat = true;
+        } else if (arg == "--sample") {
+            options.sample = true;
+        } else if (arg == "--temperature") {
+            options.temperature = std::stof(value("--temperature"));
+        } else if (arg == "--top-p") {
+            options.top_p = std::stof(value("--top-p"));
         } else if (arg == "--corpus") {
             options.corpus_path = value("--corpus");
         } else if (arg == "--corpus-root") {
@@ -218,6 +228,8 @@ BenchOptions parse_args(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
         }
     }
+    if (!options.sample && (options.temperature || options.top_p))
+        throw std::invalid_argument("--temperature and --top-p need --sample");
     if (options.coding_chat) {
         if (!options.n_prompt.empty() || !options.corpus_path.empty() ||
             options.corpus_root != kDefaultCorpusRoot) {

@@ -16,10 +16,23 @@
 namespace fngine::kernels {
 namespace {
 
+// What sample_drafts() adds to sample(): a row -> token map, a penalty overlay, a position
+// offset and a draw counter for the RNG key, the distribution output, and no token_counts
+// increment.
+struct DraftArgs {
+    const std::int32_t* id_map   = nullptr;
+    const std::int32_t* overlay  = nullptr;
+    std::int32_t overlay_len     = 0;
+    std::int32_t position_offset = 0;
+    const std::uint32_t* draw    = nullptr;
+    DraftDistribution* dist      = nullptr;
+    std::int32_t count_tokens    = 1;
+};
+
 __launch_bounds__(kSamplerBlock) __global__
     void sampling_partial_topk_kernel(const float* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
-                                      SamplingWorkspace workspace) {
+                                      SamplingWorkspace workspace, DraftArgs draft) {
     const int col            = static_cast<int>(blockIdx.y);
     const int partial        = static_cast<int>(blockIdx.x);
     const SamplingConfig cfg = *cfg_ptr;
@@ -39,7 +52,9 @@ __launch_bounds__(kSamplerBlock) __global__
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
             const float raw = logits[base + v];
-            const float x   = penalties ? sampling_adjusted_logit(raw, v, cfg) : raw;
+            const float x   = penalties ? sampling_adjusted_logit(raw, draft.id_map ? draft.id_map[v] : v,
+                                                                  cfg, draft.overlay, draft.overlay_len)
+                                        : raw;
             keys[item]      = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;
@@ -73,7 +88,7 @@ __launch_bounds__(kSamplerBlock) __global__
 __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sample_kernel(
     std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* logical_positions,
     std::int32_t purpose, std::int32_t token_domain, std::int32_t partial_blocks,
-    std::int32_t group_count, SamplingWorkspace workspace) {
+    std::int32_t group_count, SamplingWorkspace workspace, DraftArgs draft) {
     const int group          = static_cast<int>(blockIdx.x);
     const int col            = static_cast<int>(blockIdx.y);
     const int tid            = threadIdx.x;
@@ -123,9 +138,13 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         __syncthreads();
         best = sampling_block_max_key(best, greedy_warp_keys);
         if (tid == 0) {
-            const int picked = sampling_key_index(best);
+            const int row    = sampling_key_index(best);
+            const int picked = draft.id_map ? draft.id_map[row] : row;
             out[col]         = picked;
-            if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+            if (draft.count_tokens && cfg.token_counts != nullptr) {
+                atomicAdd(&cfg.token_counts[picked], 1);
+            }
+            if (draft.dist != nullptr) { draft.dist[col].n = 0; }
             workspace.group_done[col] = 0;
         }
         return;
@@ -195,18 +214,30 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
     if (tid == 0) {
         const int support = n_support;
-        const float u     = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
+        const float u     = sampling_uniform(cfg.seed, logical_positions[col] + draft.position_offset,
+                                             purpose, draft.draw != nullptr ? *draft.draw : 0u);
         float acc         = 0.0f;
-        int picked        = cand_idx[support - 1];
+        int row           = cand_idx[support - 1];
         for (int j = 0; j < support; ++j) {
             acc += prob[j];
             if (u < acc) {
-                picked = cand_idx[j];
+                row = cand_idx[j];
                 break;
             }
         }
-        out[col] = picked;
-        if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+        const int picked = draft.id_map ? draft.id_map[row] : row;
+        out[col]         = picked;
+        if (draft.count_tokens && cfg.token_counts != nullptr) {
+            atomicAdd(&cfg.token_counts[picked], 1);
+        }
+        if (draft.dist != nullptr) {
+            DraftDistribution& q = draft.dist[col];
+            q.n                  = support;
+            for (int j = 0; j < support; ++j) {
+                q.ids[j]   = draft.id_map ? draft.id_map[cand_idx[j]] : cand_idx[j];
+                q.probs[j] = prob[j];
+            }
+        }
         workspace.group_done[col] = 0;
     }
 }
@@ -232,15 +263,17 @@ std::size_t sampling_workspace_bytes(std::int32_t token_domain, std::int32_t max
     return make_sampling_workspace_layout(token_domain, max_columns).bytes;
 }
 
-void sample(const float* logits, std::int32_t T, std::int32_t token_domain,
-            const SamplingConfig* config, const std::int32_t* positions, std::int32_t purpose,
-            std::int32_t* out, void* workspace, std::size_t workspace_bytes,
-            cudaStream_t stream) {
-    if (T == 0) { return; }
-    check_route(token_domain, T, "sample");
+namespace {
+
+void launch_sample(const float* logits, std::int32_t T, std::int32_t token_domain,
+                   std::int32_t row_stride, const SamplingConfig* config,
+                   const std::int32_t* positions, std::int32_t purpose, std::int32_t* out,
+                   const DraftArgs& draft, void* workspace, std::size_t workspace_bytes,
+                   cudaStream_t stream, const char* what) {
+    check_route(token_domain, T, what);
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, T);
     if (workspace_bytes < layout.bytes) {
-        throw std::invalid_argument("sample: workspace too small");
+        throw std::invalid_argument(std::string(what) + ": workspace too small");
     }
     const std::int32_t partial_blocks = sampler_partial_blocks(token_domain);
     const std::int32_t groups         = sampler_group_count(partial_blocks);
@@ -248,12 +281,45 @@ void sample(const float* logits, std::int32_t T, std::int32_t token_domain,
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(T));
     sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
-        logits, config, token_domain, dims::kVocab, scratch);
+        logits, config, token_domain, row_stride, scratch, draft);
     CUDA_CHECK(cudaGetLastError());
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(T));
     sampling_group_finalize_sample_kernel<<<group_grid, kSamplerGroupBlock, 0, stream>>>(
-        out, config, positions, purpose, token_domain, partial_blocks, groups, scratch);
+        out, config, positions, purpose, token_domain, partial_blocks, groups, scratch, draft);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void sample(const float* logits, std::int32_t T, std::int32_t token_domain,
+            const SamplingConfig* config, const std::int32_t* positions, std::int32_t purpose,
+            std::int32_t* out, void* workspace, std::size_t workspace_bytes,
+            cudaStream_t stream) {
+    if (T == 0) { return; }
+    launch_sample(logits, T, token_domain, dims::kVocab, config, positions, purpose, out, DraftArgs{},
+                  workspace, workspace_bytes, stream, "sample");
+}
+
+void sample_drafts(const float* logits, std::int32_t rows, std::int32_t token_domain,
+                   std::int32_t row_stride, const std::int32_t* id_map, const SamplingConfig* config,
+                   const std::int32_t* positions, std::int32_t position_offset,
+                   const std::uint32_t* draw, const std::int32_t* overlay,
+                   std::int32_t overlay_len, std::int32_t* out, DraftDistribution* dist,
+                   void* workspace, std::size_t workspace_bytes, cudaStream_t stream) {
+    if (rows == 0) { return; }
+    if (row_stride < token_domain || overlay_len < 0 || (overlay_len > 0 && overlay == nullptr)) {
+        throw std::invalid_argument("sample_drafts: bad row stride or overlay");
+    }
+    DraftArgs draft;
+    draft.id_map          = id_map;
+    draft.overlay         = overlay;
+    draft.overlay_len     = overlay_len;
+    draft.position_offset = position_offset;
+    draft.draw            = draw;
+    draft.dist            = dist;
+    draft.count_tokens    = 0;
+    launch_sample(logits, rows, token_domain, row_stride, config, positions, kSamplePurposeDraft, out,
+                  draft, workspace, workspace_bytes, stream, "sample_drafts");
 }
 
 void increment_token_counts(const std::int32_t* token_ids, std::int32_t count,
