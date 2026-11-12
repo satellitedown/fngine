@@ -1,0 +1,99 @@
+{
+  "round": 7,
+  "date": "2026-11-12",
+  "model": "Qwen3.8-Flash-Next",
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "conclusion": "Sampling requests draw their MTP drafts from the draft head's own truncated distribution and verify them against it (speculative sampling: accept with min(1, p/q), correct from max(0, p - q)); every emitted token still follows the target distribution. With the model's sampling preset (temperature 1.0, top-p 0.95, top-k 20) coding chat decodes 24.7% and 29.6% more tokens per second, at temperature 0.7 / top-p 0.8 8.9% and 11.0%. The speculation controller fits one latency model to every step (shared level, GPU cost per token, measured CPU expert time) and probes the choices it left; greedy drafting and acceptance are unchanged, and greedy decode is at parity to a few percent faster.",
+  "baseline": {
+    "description": "Frozen sixth-pass build (fngine 56c25d9) with the bench's --sample option added",
+    "bench_sha256": "e63ceb8f4f0b02a39a491512db94806865b953eb20674d6e78020eb83a1f14e5"
+  },
+  "selected": {
+    "bench_note": "The paired runs measured the tree before two later edits without runtime effect: an unreachable debug log line and the unused row-stride parameter of kernels::argmax were removed.",
+    "runtime_changes": [
+      {
+        "path": "src/kernels/head/sampling.cu",
+        "symbol": "sample_drafts",
+        "description": "The sampling kernels with a row-to-token map (draft vocabulary), a penalty overlay of the earlier drafts, a per-draw RNG subkey and no token-count increment. Greedy: penalty-adjusted argmax, one-hot. Sampling: the row's truncated distribution q is stored (DraftDistribution, 20 ids and probabilities) and the draft drawn from it."
+      },
+      {
+        "path": "src/kernels/head/speculative_round.cu",
+        "symbol": "speculative_sampling_group_finalize_kernel",
+        "description": "Drafts with a stored distribution are accepted when u q(d) < p(d) and corrected from max(0, p - q) (sampling_pick_residual); other drafts keep the one-hot rule (u < p(d), correction from p without d)."
+      },
+      {
+        "path": "src/model/step_graph.cpp",
+        "symbol": "StepRunner::enqueue_mtp, StepRunner::step",
+        "description": "The MTP bridge and the two autoregressive draft steps call sample_drafts; the bridge distribution of the accepted column and the two AR distributions stay on the device for the next step's acceptance. step() takes a flag that the drafts are the previous result's MTP drafts and checks it against them. Eager steps stage the n-gram rows before launching (they hung before)."
+      },
+      {
+        "path": "src/engine/speculation.cpp",
+        "symbol": "SpeculationController",
+        "description": "Latency model seconds = D (1 + gamma T) + c C fitted to every step (D: fast EMA; gamma, c: normalized LMS; CPU seconds per token: EMA), acceptance averages weighted by how recently a position was offered, probe rounds one draft off the best choice within a 0.4% throughput budget."
+      },
+      {
+        "path": "src/engine/engine.cpp",
+        "symbol": "Engine::Impl::process",
+        "description": "Passes the CPU expert time of each step to the controller; the latency of the step that drew the MTP drafts is recorded after the decision about those drafts, so the decision cannot depend on the drawn values."
+      }
+    ]
+  },
+  "method": "Paired processes per round (order alternating), --coding-chat -n512 -r3 --spec auto --ctx 262144, one warm-up and three measured repetitions per process, Omarchy screensaver animation paused (0.0% GPU time lost to other contexts). --sample: model preset, seed = request index. Raw reports: round7/final-*/.",
+  "decode_tok_s": {
+    "greedy": {
+      "turn1": {"n": 9, "sixth": [293.75, 10.79], "seventh": [300.37, 11.69], "tokens_per_round": [2.514, 2.631]},
+      "turn2": {"n": 9, "sixth": [292.26, 16.92], "seventh": [304.50, 11.02], "tokens_per_round": [2.593, 2.734]},
+      "note": "Two earlier pairings (controller only, n = 9 each): 294.97 / 297.24 vs 295.56 / 296.96 and 298.34 / 294.68 vs 294.51 / 293.90."
+    },
+    "sample_t1.0_top_p0.95_top_k20": {
+      "turn1": {"n": 9, "sixth": [232.90, 29.79], "seventh": [290.37, 13.86], "tokens_per_round": [1.888, 2.541]},
+      "turn2": {"n": 9, "sixth": [222.47, 34.43], "seventh": [288.41, 16.32], "tokens_per_round": [1.810, 2.554]}
+    },
+    "sample_t0.7_top_p0.8": {
+      "turn1": {"n": 6, "sixth": [279.80, 8.62], "seventh": [304.82, 19.31], "tokens_per_round": [2.356, 2.644]},
+      "turn2": {"n": 6, "sixth": [264.97, 11.61], "seventh": [294.24, 13.79], "tokens_per_round": [2.217, 2.734]}
+    }
+  },
+  "offline_draft_study": {
+    "pairs": 865,
+    "tokens_per_round_three_drafts": {
+      "t1.0_top_p0.95": {"one_hot_argmax": 2.361, "sampled": 2.710, "oracle_per_position": 2.790},
+      "t0.7_top_p0.8": {"one_hot_argmax": 2.533, "sampled": 2.681, "oracle_per_position": 2.763},
+      "t1.0_top_p1.0": {"one_hot_argmax": 2.325, "sampled": 2.706, "oracle_per_position": 2.779},
+      "t0.3_top_p1.0": {"one_hot_argmax": 2.572, "sampled": 2.637, "oracle_per_position": 2.690}
+    },
+    "note": "Draft temperature x0.5-0.85, draft top-p x0.8-0.9 and argmax-when-confident hybrids were 0.1 to 4.8 points below plain sampling."
+  },
+  "controller_replay": {
+    "description": "Recorded rounds of a greedy coding chat replayed through the controller with scaled CPU expert time and acceptance (tok/s)",
+    "nominal": {"controller": 285.1, "always_three_drafts": 285.5, "best_fixed": 285.5},
+    "cpu_x2.5_acceptance_x0.85": {"controller": 191.8, "always_three_drafts": 183.1, "best_fixed": 191.3},
+    "cpu_x4_acceptance_x0.85": {"controller": 158.5, "always_three_drafts": 145.8, "best_fixed": 157.7},
+    "acceptance_x0.7": {"controller": 216.2, "always_three_drafts": 208.0, "best_fixed": 217.0}
+  },
+  "rejected": [
+    {
+      "experiment": "Lookahead for the CPU expert tier (router preview from the layer input, prefetch and decode ahead)",
+      "evidence": "Preview recall 67% at 44% precision; cold expert 38-48 us with 10-12 workers, blob read alone 34-45 us at 57-60 GB/s, decode + GEMM 220-260 us of one thread (gate/up decoding 71-79%). Within about 20% of the DRAM floor; estimated +5-15% for a second exchange protocol. Not built."
+    },
+    {
+      "experiment": "8, 16 or 32 expert swaps per step instead of 4",
+      "evidence": "Hit rate 0.949 -> 0.955 in the first 512 tokens and up to 15% less CPU wait per layer, but no shorter rounds: cold start +0.6 to +8.9% (n = 5), warmed-up sampling runs -0.9 to -5.3% (n = 6). Raw reports: round7/swap1, round7/swap2."
+    },
+    {
+      "experiment": "Draft count per round from the draft head's confidence",
+      "evidence": "Top probability vs acceptance correlation 0.54-0.63; cost-model gain 2.4% greedy, 0.5% sampled."
+    },
+    {
+      "experiment": "SMT siblings as CPU workers; CCD affinity for recurring cold experts",
+      "evidence": "28.4 vs 29.5 us per expert; 19% of a step's cold experts recur in the next step and one step's blobs (about 200 MB) exceed both L3s."
+    }
+  ],
+  "verification": {
+    "ctest": "46/46 passed",
+    "kernels_head": "sample_drafts vs CPU reference; coupled acceptance vs reference (24 random rounds); emitted distribution under coupled acceptance (2 chi-square cases x 16,000 rounds; acceptance 0.687 / 0.496 vs sum min(p,q) 0.690 / 0.495)",
+    "test_speculative_real": "greedy speculative output identical to plain decode on three prompts; first sampled MTP draft accepted 0.66-0.73 against its distribution vs 0.41-0.43 as a fixed token (temperature 1.5, top-k 20)",
+    "greedy_cli": "Greedy text varies between processes of either build, as before: of two back-to-back CLI pairs with fixed placement, one gave the same 210 tokens in both builds and one diverged (the two sixth-pass runs also differ from each other)",
+    "decision_replay": "Three traced sampling runs (eager and CUDA-graph steps, with and without penalties; 552 steps; traces from a scratch build with draft-trace hooks): 1,647 stored draft distributions, 917 acceptance decisions and 477 correction/bonus tokens recomputed on the host from the request seed (round7/dist_check.py), no difference"
+  }
+}
