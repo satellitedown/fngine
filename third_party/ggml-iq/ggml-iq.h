@@ -22,22 +22,24 @@ typedef struct { uint16_t bits; } ggml_bf16_t;
 
 #define QK_K 256
 
+// Named struct tags. nvcc 13.0 aborts in lexical.c (find_allocated_name_reference)
+// when a .cu includes these as anonymous typedef structs.
 #define QK2_0 64
-typedef struct {
+typedef struct block_q2_0 {
     ggml_half d;              // delta (scale)
     uint8_t qs[QK2_0 / 4];   // 2 bits per element
 } block_q2_0;
 IQ_STATIC_ASSERT(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
 #define QK8_0 32
-typedef struct {
+typedef struct block_q8_0 {
     ggml_half d;       // delta
     int8_t  qs[QK8_0]; // quants
 } block_q8_0;
 IQ_STATIC_ASSERT(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
 
 #define QK8_1 32
-typedef struct {
+typedef struct block_q8_1 {
     union {
         struct {
             ggml_half d; // delta
@@ -49,14 +51,14 @@ typedef struct {
 } block_q8_1;
 IQ_STATIC_ASSERT(sizeof(block_q8_1) == 2*sizeof(ggml_half) + QK8_1, "wrong q8_1 block size/padding");
 
-typedef struct {
+typedef struct block_q8_K {
     float   d;              // delta
     int8_t  qs[QK_K];       // quants
     int16_t bsums[QK_K/16]; // sum of quants in groups of 16
 } block_q8_K;
 IQ_STATIC_ASSERT(sizeof(block_q8_K) == sizeof(float) + QK_K + QK_K/16*sizeof(int16_t), "wrong q8_K block size/padding");
 
-typedef struct {
+typedef struct block_iq2_s {
     ggml_half d;
     uint8_t qs[QK_K/4];
     uint8_t qh[QK_K/32];
@@ -64,13 +66,13 @@ typedef struct {
 } block_iq2_s;
 IQ_STATIC_ASSERT(sizeof(block_iq2_s) == sizeof(ggml_half) + QK_K/4 + QK_K/16, "wrong iq2_s block size/padding");
 
-typedef struct {
+typedef struct block_iq3_xxs {
     ggml_half d;
     uint8_t qs[3*QK_K/8];
 } block_iq3_xxs;
 IQ_STATIC_ASSERT(sizeof(block_iq3_xxs) == sizeof(ggml_half) + 3*(QK_K/8), "wrong iq3_xxs block size/padding");
 
-typedef struct {
+typedef struct block_iq4_xs {
     ggml_half d;
     uint16_t scales_h;
     uint8_t  scales_l[QK_K/64];
@@ -79,7 +81,7 @@ typedef struct {
 IQ_STATIC_ASSERT(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
 #define IQ3S_N_SCALE (QK_K/64)
-typedef struct {
+typedef struct block_iq3_s {
     ggml_half d;
     uint8_t qs[QK_K/4];
     uint8_t qh[QK_K/32];
@@ -89,7 +91,7 @@ typedef struct {
 IQ_STATIC_ASSERT(sizeof(block_iq3_s) == sizeof(ggml_half) + 13*(QK_K/32) + IQ3S_N_SCALE, "wrong iq3_s block size/padding");
 
 #define QK4_NL 32
-typedef struct {
+typedef struct block_iq4_nl {
     ggml_half d;
     uint8_t qs[QK4_NL/2];
 } block_iq4_nl;
