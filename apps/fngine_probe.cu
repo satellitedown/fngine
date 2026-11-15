@@ -2,6 +2,8 @@
 // prints one JSON object: GPU, PCIe copy bandwidth with the link state sampled
 // during the copy, CPU streaming-read bandwidth, GPU<->CPU doorbell latency and
 // io_uring O_DIRECT random-read IOPS.
+#include "cpu/cpu_isa.h"
+
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <immintrin.h>
@@ -202,10 +204,11 @@ std::vector<CpuBw> probe_cpu_bandwidth() {
         ts.emplace_back([&, t] {
           pin_to(kCpuOrder[t]);
           size_t per = kBytes / n / 64 * 64;
-          const __m512i* p = reinterpret_cast<const __m512i*>(static_cast<char*>(mem) + per * t);
-          size_t cnt = per / 64;
           ready.fetch_add(1);
           while (!go.load(std::memory_order_acquire)) _mm_pause();
+#if FNGINE_CPU_BACKEND_AVX512
+          const __m512i* p = reinterpret_cast<const __m512i*>(static_cast<char*>(mem) + per * t);
+          size_t cnt = per / 64;
           __m512i acc0 = _mm512_setzero_si512(), acc1 = acc0, acc2 = acc0, acc3 = acc0;
           size_t i = 0;
           for (; i + 4 <= cnt; i += 4) {
@@ -216,6 +219,22 @@ std::vector<CpuBw> probe_cpu_bandwidth() {
           }
           acc0 = _mm512_add_epi64(_mm512_add_epi64(acc0, acc1), _mm512_add_epi64(acc2, acc3));
           sink[t * 8] = _mm512_reduce_add_epi64(acc0);
+#else
+          const __m256i* p = reinterpret_cast<const __m256i*>(static_cast<char*>(mem) + per * t);
+          size_t cnt = per / sizeof(__m256i);
+          __m256i acc0 = _mm256_setzero_si256(), acc1 = acc0, acc2 = acc0, acc3 = acc0;
+          size_t i = 0;
+          for (; i + 4 <= cnt; i += 4) {
+            acc0 = _mm256_add_epi64(acc0, _mm256_load_si256(p + i));
+            acc1 = _mm256_add_epi64(acc1, _mm256_load_si256(p + i + 1));
+            acc2 = _mm256_add_epi64(acc2, _mm256_load_si256(p + i + 2));
+            acc3 = _mm256_add_epi64(acc3, _mm256_load_si256(p + i + 3));
+          }
+          acc0 = _mm256_add_epi64(_mm256_add_epi64(acc0, acc1), _mm256_add_epi64(acc2, acc3));
+          __m128i sum128 = _mm_add_epi64(_mm256_castsi256_si128(acc0), _mm256_extracti128_si256(acc0, 1));
+          sum128 = _mm_add_epi64(sum128, _mm_srli_si128(sum128, 8));
+          sink[t * 8] = static_cast<uint64_t>(_mm_cvtsi128_si64(sum128));
+#endif
         });
       while (ready.load() != n) _mm_pause();
       auto t0 = Clock::now();
@@ -393,6 +412,12 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (!fngine::cpu::cpu_backend_usable()) {
+    std::fprintf(stderr, "CPU does not support the compiled expert backend (%s)\n",
+                 fngine::cpu::cpu_backend_name());
+    return 1;
+  }
+
   cudaDeviceProp prop{};
   CK(cudaGetDeviceProperties(&prop, 0));
   size_t free_b = 0, total_b = 0;
@@ -405,6 +430,7 @@ int main(int argc, char** argv) {
   if (!file.empty()) io = probe_io(file);
 
   std::printf("{\n");
+  std::printf("  \"cpu_backend\": %s,\n", json_str(fngine::cpu::cpu_backend_name()).c_str());
   std::printf("  \"gpu\": {\"name\": %s, \"sms\": %d, \"cc\": \"%d.%d\", \"free_mib\": %zu, \"total_mib\": %zu},\n",
               json_str(prop.name).c_str(), prop.multiProcessorCount, prop.major, prop.minor,
               free_b >> 20, total_b >> 20);

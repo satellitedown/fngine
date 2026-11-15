@@ -14,7 +14,10 @@ The target workstation's PCIe link was observed at **x4**, not x16, with approxi
 
 ## Build
 
-Requires Linux x86_64, CUDA 13.3 (the installer pins 13.3.73 with cuBLAS 13.6.0.2), a compatible host C++20 compiler, CMake ≥ 3.28, Ninja and liburing. The CUDA architecture is `120a` (RTX 5090). The CPU expert path needs AVX-512 F/BW/DQ/VL with VNNI, BF16, VBMI, BITALG and VPOPCNTDQ (AMD Zen 4/5, Intel Sapphire Rapids and later); it compiles for the building CPU by default, and `-DFNGINE_CPU_ARCH=<march>` targets another.
+Requires Linux x86_64, CUDA 13.3 (the installer pins 13.3.73 with cuBLAS 13.6.0.2), a compatible host C++20 compiler, CMake ≥ 3.28, Ninja and liburing. The CUDA architecture is `120a` (RTX 5090). The CPU expert path needs one of two ISAs, chosen from `-march` (`FNGINE_CPU_ARCH`, default `native`; `-DFNGINE_CPU_ARCH=<march>` targets another). AVX-512 is used when the target has both:
+
+- AVX-512 F/BW/DQ/VL with VNNI, BF16, VBMI, BITALG and VPOPCNTDQ (AMD Zen 4/5, Intel Sapphire Rapids, Granite Rapids and later).
+- AVX2 + FMA + AVX-VNNI + AVX-NE-CONVERT + F16C (Intel Arrow Lake / Core Ultra 200S, which have no AVX-512). GCC 13 has no `-march=arrowlake`; `native` selects this backend.
 
 ```sh
 cmake --preset dev

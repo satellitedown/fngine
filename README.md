@@ -4,7 +4,7 @@ A C++20/CUDA inference engine that runs **Qwen3.8-Flash-Next** on one RTX 5090 (
 
 The model doesn't fit in VRAM, so fngine splits it:
 
-- **Experts:** about half of the 24,576 routed experts sit on the GPU. The rest stay in RAM and run on the CPU (AVX-512), or stream over PCIe for long prompts. Placement follows what you actually use and adapts every decode step.
+- **Experts:** about half of the 24,576 routed experts sit on the GPU. The rest stay in RAM and run on the CPU (AVX-512, or AVX2 with AVX-VNNI and AVX-NE-CONVERT), or stream over PCIe for long prompts. Placement follows what you actually use and adapts every decode step.
 - **Everything else:** FP8 dense weights, an 8-bit KV cache (K8V8), and the model's n-gram table read from NVMe on demand.
 - **Speculative decoding** with the model's MTP head and prompt lookup. Drafts are checked exactly, so output matches plain decoding.
 
@@ -31,7 +31,7 @@ Choose 1 to install, then 3 to start.
 
 ## Build from source
 
-Needs Linux x86_64, CUDA 13.3, a C++20 compiler, CMake 3.28+, Ninja and liburing. The CPU expert path needs AVX-512 with VNNI, BF16 and VBMI (AMD Zen 4/5, Intel Sapphire Rapids or newer).
+Needs Linux x86_64, CUDA 13.3, a C++20 compiler, CMake 3.28+, Ninja and liburing. The CPU expert path needs either AVX-512 with VNNI, BF16 and VBMI (AMD Zen 4/5, Intel Sapphire Rapids or newer) or AVX2 with AVX-VNNI and AVX-NE-CONVERT (Intel Arrow Lake / Core Ultra 200S). `-march=native` selects the backend; AVX-512 is used when the target has both.
 
 ```sh
 cmake --preset dev        # --preset release skips the tests

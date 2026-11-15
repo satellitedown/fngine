@@ -1,3 +1,5 @@
+#include "cpu/cpu_isa.h"
+#if FNGINE_CPU_BACKEND_AVX512
 #include "cpu/q8_cpu.h"
 
 #include <immintrin.h>
@@ -108,3 +110,4 @@ void quantize_row_q8_0_f32(const float* x, block_q8_0* y, int64_t k) {
 }
 
 }  // namespace fngine::cpu
+#endif

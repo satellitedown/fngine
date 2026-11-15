@@ -1,6 +1,7 @@
 #include "cpu/expert_pool.h"
 
 #include "core/cpu_topology.h"
+#include "cpu/cpu_isa.h"
 
 #include <immintrin.h>
 #include <linux/futex.h>
@@ -362,9 +363,22 @@ struct ExpertPool::Impl {
       silu_mul(gv, uv, hv, kChunkA);
       auto* h = hbuf->p + std::size_t(g.begin + tk.p0 + t) * step_h_stride;
       if (step_mode == PoolMode::Prefill) {
+#if FNGINE_CPU_BACKEND_AVX512
         _mm512_storeu_si512(reinterpret_cast<uint16_t*>(h) + tk.chunk * kChunkA,
                             (__m512i)_mm512_cvtne2ps_pbh(_mm512_load_ps(hv + 16),
                                                        _mm512_load_ps(hv)));
+#else
+        // AVX-NE-CONVERT has a 256-bit convert. Two stores cover the 32 BF16 lanes.
+        auto cvt2ps_to_pbh = [](__m256 a_hi, __m256 b_lo) -> __m256i {
+          __m128i lo = (__m128i)_mm256_cvtneps_avx_pbh(b_lo);
+          __m128i hi = (__m128i)_mm256_cvtneps_avx_pbh(a_hi);
+          return _mm256_set_m128i(hi, lo);
+        };
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(reinterpret_cast<uint16_t*>(h) + tk.chunk * kChunkA),
+                            cvt2ps_to_pbh(_mm256_load_ps(hv + 8), _mm256_load_ps(hv)));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(reinterpret_cast<uint16_t*>(h) + tk.chunk * kChunkA + 16),
+                            cvt2ps_to_pbh(_mm256_load_ps(hv + 24), _mm256_load_ps(hv + 16)));
+#endif
       } else {
         quantize_pack_q8_0_half(hv, tk.chunk / 2, tk.chunk % 2, h);
       }

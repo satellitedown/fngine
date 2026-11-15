@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-// CPU expert matmul for the GGUF expert weight formats (AVX-512 VNNI/VBMI/BITALG, Zen 5).
+// CPU expert matmul for the GGUF expert weight formats.
+// AVX-512 VNNI/VBMI/BITALG/BF16 (iq_cpu.cpp: Zen 4/5, Sapphire Rapids, Granite Rapids)
+// or AVX2 + FMA + AVX-VNNI + AVX-NE-CONVERT (iq_cpu_avx2.cpp: Arrow Lake / Core Ultra 200S).
+// cpu_isa.h compiles exactly one. Both use the layouts below.
 //
-// Two kernel-native layouts, both built from 64-element "chunks" (one zmm of int8):
+// Two kernel-native layouts, both built from 64-element "chunks" (one zmm, or two ymm, of int8):
 //
 //  * Decoded weights: each GGUF block is expanded ONCE (grid lookups, signs applied) into
 //    biased uint8 values w + 128, plus one float vector of per-lane scales:

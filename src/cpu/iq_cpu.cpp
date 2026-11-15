@@ -1,3 +1,5 @@
+#include "cpu/cpu_isa.h"
+#if FNGINE_CPU_BACKEND_AVX512
 // Modified for fngine from llama.cpp/ggml:ggml/src/ggml-cpu/arch/x86/quants.c @ 3cf03257f219afbe7334045ff7c6a06ac68c627d. See NOTICE.
 // SPDX-License-Identifier: MIT
 //
@@ -821,3 +823,4 @@ void cpu_dot_ptr(WeightFormat fmt, const void* row, int nblk, const void* const*
 }
 
 }  // namespace fngine::cpu
+#endif

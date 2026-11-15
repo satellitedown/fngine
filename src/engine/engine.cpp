@@ -18,6 +18,7 @@
 #include "core/cpu_topology.h"
 #include "core/exchange.h"
 #include "core/model_dims.h"
+#include "cpu/cpu_isa.h"
 #include "engine/session.h"
 #include "engine/speculation.h"
 #include "model/runtime.h"
@@ -36,6 +37,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <stdexcept>
 #include <string_view>
 #include <deque>
 #include <exception>
@@ -375,6 +377,11 @@ void Engine::Impl::run(std::promise<void>* ready) {
         spdlog::warn("CPU topology detection failed: {}", error.what());
     }
     try {
+        if (!cpu::cpu_backend_usable()) {
+            throw std::runtime_error(std::string("CPU does not support the compiled expert backend (") +
+                                     cpu::cpu_backend_name() + ")");
+        }
+        spdlog::info("CPU expert backend: {}", cpu::cpu_backend_name());
         start_runtime();
     } catch (...) {
         runner_.reset();
